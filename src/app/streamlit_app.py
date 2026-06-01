@@ -1,13 +1,12 @@
+# Ensure project root is on sys.path when run via `streamlit run src/app/streamlit_app.py`
+import sys as _sys, pathlib as _pl
+_root = str(_pl.Path(__file__).resolve().parents[2])
+if _root not in _sys.path:
+    _sys.path.insert(0, _root)
+
 """Streamlit UI — Zomato AI Recommends.
-# Path fix: ensure project root is on sys.path when run via `streamlit run`
-import sys as _sys
-from pathlib import Path as _Path
-_root = _Path(__file__).resolve().parents[2]
-if str(_root) not in _sys.path:
-    _sys.path.insert(0, str(_root))
 
 Design system based on Google Stitch output (stitch_zomato_ai_recommends.zip).
-Colors, typography, and component styles match the Stitch-generated design tokens.
 
 Run:
     streamlit run src/app/streamlit_app.py
