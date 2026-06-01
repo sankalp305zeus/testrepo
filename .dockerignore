@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets — never bake into the image
+.env
+
+# Dataset cache — mounted as a volume at runtime
+data/hf_cache/
+data/restaurants.parquet
+
+# Dev tooling
+.git/
+.github/
+*.md
+docs/
+Makefile
+
+# IDE
+.vscode/
+.idea/
+*.swp

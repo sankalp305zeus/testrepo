@@ -1,5 +1,11 @@
-"""
-Recommendation engine: LLM ranking + explanations with validation and fallback.
+"""Recommendation engine — LLM ranking, validation, and fallback.
+
+Flow (see architecture.md §5.4):
+  1. Build prompt from shortlist + preferences.
+  2. Call Groq; parse JSON response.
+  3. Cross-check every returned restaurant_name against the shortlist.
+  4. On malformed JSON: retry once.
+  5. On any LLM failure: return rule-based top-N with template explanations.
 """
 
 from __future__ import annotations
@@ -8,8 +14,9 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.llm.client import LLMClient, LLMError, get_llm_client
 from src.llm.prompts import build_messages
@@ -20,15 +27,20 @@ from src.models.restaurant import Restaurant
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_RECOMMENDATIONS = 5
+
 FALLBACK_EXPLANATION = (
     "Ranked by rating based on your filters. "
-    "Personalized AI explanations are unavailable."
+    "Personalised AI explanations are unavailable."
 )
 
 
+# ---------------------------------------------------------------------------
+# Result wrapper
+# ---------------------------------------------------------------------------
+
 @dataclass
 class RecommendationResult:
-    """Outcome of the recommendation step."""
+    """Full output of one recommendation request."""
 
     recommendations: List[Recommendation]
     summary: Optional[str] = None
@@ -37,35 +49,40 @@ class RecommendationResult:
     code: str = "OK"
 
 
-def _extract_json_text(raw: str) -> str:
-    text = raw.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence:
-        return fence.group(1).strip()
-    return text
+# ---------------------------------------------------------------------------
+# JSON parsing helpers
+# ---------------------------------------------------------------------------
+
+def _strip_markdown_fence(text: str) -> str:
+    """Remove ```json ... ``` fences that some models add despite instructions."""
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text.strip())
+    return match.group(1).strip() if match else text.strip()
 
 
-def _parse_llm_payload(raw: str) -> Dict[str, Any]:
-    text = _extract_json_text(raw)
+def _parse_payload(raw: str) -> Dict[str, Any]:
+    text = _strip_markdown_fence(raw)
     data = json.loads(text)
     if isinstance(data, list):
         return {"recommendations": data}
     if not isinstance(data, dict):
-        raise ValueError("LLM response must be a JSON object or array")
+        raise ValueError(f"Expected JSON object, got {type(data).__name__}")
     return data
 
 
-def _find_restaurant(name: str, shortlist: Sequence[Restaurant]) -> Optional[Restaurant]:
+def _find_in_shortlist(name: str, shortlist: Sequence[Restaurant]) -> Optional[Restaurant]:
+    """Return the shortlist entry whose name matches; None if not found (hallucination)."""
     target = name.strip().casefold()
     if not target:
         return None
-    for restaurant in shortlist:
-        if restaurant.name.casefold() == target:
-            return restaurant
-    for restaurant in shortlist:
-        n = restaurant.name.casefold()
+    # Exact match first.
+    for r in shortlist:
+        if r.name.casefold() == target:
+            return r
+    # Substring fallback (handles minor LLM paraphrasing).
+    for r in shortlist:
+        n = r.name.casefold()
         if target in n or n in target:
-            return restaurant
+            return r
     return None
 
 
@@ -84,15 +101,15 @@ def _item_to_recommendation(
     if not name:
         return None
 
-    matched = _find_restaurant(name, shortlist)
+    matched = _find_in_shortlist(name, shortlist)
     if matched is None:
-        logger.debug("Dropping LLM pick not in shortlist: %s", name)
+        logger.debug("LLM hallucination dropped: %r", name)
         return None
 
     cuisine = str(item.get("cuisine") or matched.cuisine_display()).strip()
     rating = _coerce_float(item.get("rating"), matched.rating)
     cost = _coerce_float(
-        item.get("estimated_cost", item.get("cost_for_two")),
+        item.get("estimated_cost") or item.get("cost_for_two"),
         matched.cost_for_two,
     )
     explanation = str(item.get("explanation") or "").strip()
@@ -116,18 +133,26 @@ def parse_llm_recommendations(
     shortlist: Sequence[Restaurant],
     *,
     max_items: int = DEFAULT_MAX_RECOMMENDATIONS,
-) -> tuple[List[Recommendation], Optional[str]]:
-    payload = _parse_llm_payload(raw)
-    summary = payload.get("summary")
-    if summary is not None:
-        summary = str(summary).strip() or None
+) -> Tuple[List[Recommendation], Optional[str]]:
+    """Parse and validate the raw LLM JSON string.
+
+    Returns (recommendations, optional_summary).
+    Raises json.JSONDecodeError or ValueError on bad input.
+    """
+    payload = _parse_payload(raw)
+
+    summary: Optional[str] = None
+    raw_summary = payload.get("summary")
+    if raw_summary:
+        summary = str(raw_summary).strip() or None
 
     items = payload.get("recommendations", [])
     if not isinstance(items, list):
-        raise ValueError("recommendations must be a JSON array")
+        raise ValueError('"recommendations" must be a JSON array')
 
     results: List[Recommendation] = []
-    seen_names: set[str] = set()
+    seen: set[str] = set()
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -135,9 +160,9 @@ def parse_llm_recommendations(
         if rec is None:
             continue
         key = rec.restaurant_name.casefold()
-        if key in seen_names:
+        if key in seen:
             continue
-        seen_names.add(key)
+        seen.add(key)
         results.append(rec)
         if len(results) >= max_items:
             break
@@ -145,77 +170,85 @@ def parse_llm_recommendations(
     return results, summary
 
 
-def _fallback_recommendations(
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
+
+def _build_fallback(
     shortlist: Sequence[Restaurant],
     prefs: UserPreferences,
-    *,
-    max_items: int = DEFAULT_MAX_RECOMMENDATIONS,
+    max_items: int,
 ) -> RecommendationResult:
+    """Rule-based top-N: sorted by rating, with template explanation."""
     picks = list(shortlist)[:max_items]
-    recommendations: List[Recommendation] = []
-    for restaurant in picks:
-        recommendations.append(
-            Recommendation(
-                restaurant_name=restaurant.name,
-                cuisine=restaurant.cuisine_display(),
-                rating=restaurant.rating,
-                estimated_cost=restaurant.cost_for_two,
-                explanation=(
-                    f"{FALLBACK_EXPLANATION} "
-                    f"Strong {restaurant.rating}★ match for {prefs.cuisine_normalized} "
-                    f"in {prefs.location_normalized} ({prefs.budget} budget)."
-                ),
-            )
+    recs = [
+        Recommendation(
+            restaurant_name=r.name,
+            cuisine=r.cuisine_display(),
+            rating=r.rating,
+            estimated_cost=r.cost_for_two,
+            explanation=(
+                f"{FALLBACK_EXPLANATION} "
+                f"{r.rating}★ for {prefs.cuisine_normalized} "
+                f"in {prefs.location_normalized} ({prefs.budget} budget)."
+            ),
         )
+        for r in picks
+    ]
     return RecommendationResult(
-        recommendations=recommendations,
-        summary="Showing top matches ranked by rating (LLM unavailable).",
+        recommendations=recs,
+        summary="Showing top matches by rating (Groq unavailable).",
         used_fallback=True,
-        message="LLM unavailable; using rule-based ranking.",
+        message="LLM unavailable; showing rule-based ranking.",
         code="FALLBACK",
     )
 
 
-def _backfill_from_shortlist(
+def _backfill(
     current: List[Recommendation],
     shortlist: Sequence[Restaurant],
     prefs: UserPreferences,
     max_items: int,
 ) -> List[Recommendation]:
+    """Pad LLM results with shortlist entries when Groq returns fewer than max_items."""
     if len(current) >= max_items:
         return current[:max_items]
 
     used = {r.restaurant_name.casefold() for r in current}
-    for restaurant in shortlist:
-        if restaurant.name.casefold() in used:
+    for r in shortlist:
+        if r.name.casefold() in used:
             continue
         current.append(
             Recommendation(
-                restaurant_name=restaurant.name,
-                cuisine=restaurant.cuisine_display(),
-                rating=restaurant.rating,
-                estimated_cost=restaurant.cost_for_two,
+                restaurant_name=r.name,
+                cuisine=r.cuisine_display(),
+                rating=r.rating,
+                estimated_cost=r.cost_for_two,
                 explanation=(
-                    f"Added from your filtered shortlist for {prefs.cuisine_normalized} "
+                    f"Added from filtered shortlist for {prefs.cuisine_normalized} "
                     f"in {prefs.location_normalized}."
                 ),
             )
         )
-        used.add(restaurant.name.casefold())
+        used.add(r.name.casefold())
         if len(current) >= max_items:
             break
     return current
 
 
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
 class RecommendationEngine:
-    """Orchestrates LLM calls, parsing, validation, and fallback."""
+    """Orchestrates Groq LLM call, JSON parsing, validation, and fallback."""
 
     def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
-        self._llm_client = llm_client
+        self._client = llm_client
 
-    def _client(self) -> LLMClient:
-        if self._llm_client is not None:
-            return self._llm_client
+    def _get_client(self) -> LLMClient:
+        if self._client is not None:
+            return self._client
         return get_llm_client()
 
     def recommend(
@@ -229,60 +262,62 @@ class RecommendationEngine:
             return RecommendationResult(
                 recommendations=[],
                 code="EMPTY_SHORTLIST",
-                message="No restaurants to recommend. Adjust filters first.",
+                message="No restaurants to recommend — adjust your filters first.",
             )
 
         max_recommendations = max(1, min(max_recommendations, 10))
 
-        if self._llm_client is None and os.getenv("MOCK_LLM", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
-            logger.info("MOCK_LLM=1 — using rule-based fallback")
-            return _fallback_recommendations(shortlist, prefs, max_items=max_recommendations)
+        # Honour MOCK_LLM env flag when no explicit client is injected.
+        if self._client is None and os.getenv("MOCK_LLM", "").lower() in ("1", "true", "yes"):
+            logger.info("MOCK_LLM=1 — returning rule-based fallback.")
+            return _build_fallback(shortlist, prefs, max_recommendations)
 
+        # Resolve client (raises LLMError when key is missing).
         try:
-            client = self._llm_client if self._llm_client is not None else self._client()
+            client = self._get_client()
         except LLMError as exc:
             logger.warning("LLM client unavailable: %s", exc)
-            return _fallback_recommendations(shortlist, prefs, max_items=max_recommendations)
+            return _build_fallback(shortlist, prefs, max_recommendations)
 
         messages = build_messages(shortlist, prefs, max_recommendations=max_recommendations)
         last_error: Optional[Exception] = None
 
-        for attempt in range(2):
+        for attempt in range(1, 3):  # up to 2 attempts
             try:
+                t0 = time.perf_counter()
                 raw = client.complete(messages)
-                recommendations, summary = parse_llm_recommendations(
-                    raw,
-                    shortlist,
-                    max_items=max_recommendations,
+                llm_latency = time.perf_counter() - t0
+                logger.info("Groq latency: %.2fs (attempt %d)", llm_latency, attempt)
+                recs, summary = parse_llm_recommendations(
+                    raw, shortlist, max_items=max_recommendations
                 )
-                if recommendations:
-                    recommendations = _backfill_from_shortlist(
-                        recommendations,
-                        shortlist,
-                        prefs,
-                        max_recommendations,
+                if recs:
+                    recs = _backfill(recs, shortlist, prefs, max_recommendations)
+                    logger.info(
+                        "Recommendation: %d picks returned (fallback=False)",
+                        len(recs[:max_recommendations]),
                     )
                     return RecommendationResult(
-                        recommendations=recommendations[:max_recommendations],
+                        recommendations=recs[:max_recommendations],
                         summary=summary,
-                        used_fallback=False,
                         code="OK",
                     )
-                last_error = ValueError("No valid recommendations in LLM response")
+                last_error = ValueError("LLM returned no valid recommendations.")
+                logger.warning("Attempt %d: no valid recommendations in response.", attempt)
             except (LLMError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
                 last_error = exc
-                logger.warning("LLM attempt %d failed: %s", attempt + 1, exc)
-            except Exception as exc:
+                logger.warning("Attempt %d failed: %s", attempt, exc)
+            except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                logger.warning("LLM attempt %d unexpected error: %s", attempt + 1, exc)
+                logger.warning("Attempt %d unexpected error: %s", attempt, exc)
 
-        logger.warning("Falling back after LLM failure: %s", last_error)
-        return _fallback_recommendations(shortlist, prefs, max_items=max_recommendations)
+        logger.warning("Both LLM attempts failed (%s); using fallback.", last_error)
+        return _build_fallback(shortlist, prefs, max_recommendations)
 
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper
+# ---------------------------------------------------------------------------
 
 def recommend(
     shortlist: Sequence[Restaurant],
@@ -291,6 +326,7 @@ def recommend(
     llm_client: Optional[LLMClient] = None,
     max_recommendations: int = DEFAULT_MAX_RECOMMENDATIONS,
 ) -> RecommendationResult:
-    """Convenience wrapper around RecommendationEngine."""
-    engine = RecommendationEngine(llm_client=llm_client)
-    return engine.recommend(shortlist, prefs, max_recommendations=max_recommendations)
+    """Shorthand: create a RecommendationEngine and call recommend()."""
+    return RecommendationEngine(llm_client=llm_client).recommend(
+        shortlist, prefs, max_recommendations=max_recommendations
+    )

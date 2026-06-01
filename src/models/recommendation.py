@@ -8,7 +8,10 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class Recommendation:
-    """User-facing recommendation (matches context.md output fields)."""
+    """Single restaurant recommendation returned by the LLM engine.
+
+    Fields match the output table in context.md.
+    """
 
     restaurant_name: str
     cuisine: str

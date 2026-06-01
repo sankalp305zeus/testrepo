@@ -9,11 +9,14 @@ Budget bands (cost_for_two, INR) derived from catalog percentiles:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.models.preferences import Budget, UserPreferences
 from src.models.restaurant import Restaurant
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SHORTLIST_CAP = 50
 
@@ -217,6 +220,15 @@ def filter_restaurants(
 
     ranked = sorted(matched, key=_sort_key)
     shortlist = ranked[:max_results]
+    logger.info(
+        "Filter: %d/%d restaurants matched (location=%r cuisine=%r budget=%s min_rating=%.1f)",
+        len(shortlist),
+        len(catalog),
+        prefs.location_normalized,
+        prefs.cuisine_normalized,
+        prefs.budget,
+        prefs.min_rating,
+    )
     return FilterResult(
         restaurants=shortlist,
         code="OK",

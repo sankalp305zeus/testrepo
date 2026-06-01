@@ -1,354 +1,146 @@
 # Architecture: AI-Powered Restaurant Recommendation System
 
-This document describes **how** the system is structured: layers, components, data contracts, and runtime flow. It is derived from [context.md](./context.md) and aligned with [problemStatement.md](./problemStatement.md) and [implementation-plan.md](./docs/implementation-plan.md).
+This document describes **how** the system is structured across its full stack: backend pipeline layers, REST API, React frontend, and deployment. It reflects the current state of the project (Phases 0–6 complete) and the target state through Phase 9.
+
+**Related docs:** [context.md](./context.md) · [implementation-plan.md](./implementation-plan.md) · [edge-cases.md](./edge-cases.md) · [deployment.md](./deployment.md)
 
 ---
 
-## 1. Architectural Goals
+## 1. Architectural goals
 
 | Goal | Rationale |
 |------|-----------|
-| **Separation of concerns** | Data loading, filtering, LLM reasoning, and UI are independent modules so each can be tested and replaced. |
-| **Structured-first, LLM-second** | The LLM ranks and explains only from a pre-filtered shortlist—reducing hallucination risk and token cost. |
-| **Deterministic filtering** | Location, budget, cuisine, and rating rules run without an LLM for predictable, fast narrowing. |
-| **Graceful degradation** | If the LLM fails, return rule-based rankings with a clear fallback message. |
-| **MVP-friendly deployment** | Single-process app (e.g. Streamlit) with optional path to REST API later. |
+| **Separation of concerns** | Backend pipeline, REST API, and frontend are independent layers — each replaceable without touching the others |
+| **Structured-first, LLM-second** | The LLM ranks only a pre-filtered shortlist, reducing hallucination risk and token cost |
+| **Single pipeline contract** | All callers (Streamlit, API, CLI) use `orchestrator.run(PipelineRequest) → PipelineResponse` |
+| **Graceful degradation** | LLM failure returns rule-based rankings; API never returns 500 on pipeline errors |
+| **Frontend/backend decoupled** | React frontend consumes FastAPI via HTTP/JSON — independent deploy, independent scaling |
 
 ---
 
-## 2. High-Level System Context
+## 2. Full-stack system context
 
 ```mermaid
 flowchart LR
+    subgraph Clients
+        FE[React / Next.js Frontend]
+        ST[Streamlit MVP]
+        CLI[CLI / scripts]
+    end
+
+    subgraph Backend["Python Backend"]
+        API[FastAPI — src/api/]
+        ORCH[Orchestrator — src/recommendation/]
+        FILTER[Filter Engine — src/filter/]
+        LLM_MOD[LLM Engine — src/llm/ + src/recommendation/]
+        DATA[Data Layer — src/data/]
+        CACHE[LRU Cache — src/recommendation/cache.py]
+    end
+
     subgraph External
-        HF[(Hugging Face Dataset)]
-        GROQ[(Groq API)]
+        HF[(Hugging Face\nZomato Dataset)]
+        GROQ[(Groq API\nllama-3.3-70b)]
     end
 
-    subgraph System["Recommendation System"]
-        UI[Presentation Layer]
-        ORCH[Orchestrator / Pipeline]
-        DATA[Data Layer]
-        FILTER[Filtering Layer]
-        INT[Integration Layer]
-        REC[Recommendation Engine]
-    end
-
-    User((User)) --> UI
-    UI --> ORCH
-    ORCH --> DATA
-    DATA --> HF
+    FE -->|POST /recommendations\nGET /cities| API
+    ST --> ORCH
+    CLI --> ORCH
+    API --> ORCH
+    ORCH --> CACHE
     ORCH --> FILTER
-    FILTER --> INT
-    INT --> REC
-    REC --> GROQ
-    REC --> UI
+    ORCH --> LLM_MOD
+    LLM_MOD --> GROQ
+    DATA --> HF
+    DATA --> FILTER
 ```
-
-**Actors**
-* **User** — Submits preferences and reads recommendations.
-* **Hugging Face** — Source of truth for restaurant catalog ([ManikaSaini/zomato-restaurant-recommendation](https://huggingface.co/datasets/ManikaSaini/zomato-restaurant-recommendation)).
-* **Groq** — LLM provider (Phase 3–4). Ranks shortlist, writes explanations, optional summary via chat completions API.
 
 ---
 
-## 3. Layered Architecture
+## 3. Layered architecture
 
-The system follows five logical layers mapped directly to [context.md](./context.md) workflow sections.
+The system is organised into **7 layers**. Layers only depend downward — higher layers never import from lower layers' internals.
 
-```mermaid
-flowchart TB
-    subgraph L5["Layer 5 — Presentation"]
-        UI[Streamlit / CLI]
-    end
-
-    subgraph L4["Layer 4 — Recommendation Engine"]
-        RE[Rank + Explain + Summarize]
-    end
-
-    subgraph L3["Layer 3 — Integration"]
-        PM[Prompt Builder]
-        PR[Response Parser]
-    end
-
-    subgraph L2["Layer 2 — Filtering"]
-        FE[Filter Engine]
-    end
-
-    subgraph L1["Layer 1 — Data"]
-        IN[Ingest + Normalize]
-        CA[(Local Cache)]
-    end
-
-    UI --> FE
-    FE --> PM
-    PM --> RE
-    RE --> PR
-    PR --> UI
-    IN --> CA
-    CA --> FE
+```
+Layer 7 — Frontend (React/Next.js)       frontend/
+Layer 6 — REST API (FastAPI)             src/api/
+Layer 5 — Presentation / Streamlit MVP   src/app/
+Layer 4 — Orchestration + Cache          src/recommendation/orchestrator.py, cache.py
+Layer 3 — LLM Integration               src/llm/, src/recommendation/engine.py
+Layer 2 — Filtering                      src/filter/
+Layer 1 — Data                           src/data/, src/models/
 ```
 
-| Layer | Maps to context.md | Responsibility |
-|-------|-------------------|----------------|
-| **Data** | [Data Ingestion](./context.md#1-data-ingestion) | Load dataset, normalize schema, cache catalog |
-| **Filtering** | [User Input](./context.md#2-user-input) (constraints) | Apply hard filters; produce shortlist |
-| **Integration** | [Integration Layer](./context.md#3-integration--llm-prompting-layer) | Serialize shortlist + prefs into LLM prompt; parse JSON response |
-| **Recommendation** | [Recommendation Engine](./context.md#4-recommendation-engine) | Invoke LLM; validate output; fallback ranking |
-| **Presentation** | [Output Display](./context.md#5-output-presentation) | Forms, validation, formatted results |
+| Layer | Module | Responsibility |
+|-------|--------|----------------|
+| **1 — Data** | `src/data/ingest.py` | Download HF dataset, normalize, write parquet cache, expose `load_catalog()` |
+| **2 — Filtering** | `src/filter/engine.py` | Apply location / budget / cuisine / rating / extras rules; return `FilterResult` with hints |
+| **3 — LLM Integration** | `src/llm/client.py`, `src/llm/prompts.py`, `src/recommendation/engine.py` | Build prompt, call Groq, parse JSON, retry, fallback |
+| **4 — Orchestration** | `src/recommendation/orchestrator.py`, `cache.py`, `contracts.py` | Owns the full pipeline; exposes `PipelineRequest → PipelineResponse`; LRU cache |
+| **5 — Streamlit MVP** | `src/app/streamlit_app.py` | Phase 4 monolithic UI — useful for demos; superseded by Layers 6+7 |
+| **6 — REST API** | `src/api/main.py`, `routes/` | FastAPI; exposes pipeline over HTTP; Pydantic validation; CORS |
+| **7 — Frontend** | `frontend/` | React/Next.js; consumes Layer 6 API; full design spec UI |
 
 ---
 
-## 4. End-to-End Request Flow
+## 4. End-to-end request flow (Phase 7+ full stack)
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant UI as Presentation
-    participant F as Filter Engine
-    participant P as Prompt Builder
-    participant L as LLM Client
-    participant R as Recommendation Engine
-    participant D as Data / Cache
+    participant U as User (Browser)
+    participant FE as React Frontend
+    participant API as FastAPI
+    participant ORCH as Orchestrator
+    participant CACHE as LRU Cache
+    participant FILTER as Filter Engine
+    participant LLM as Groq
 
-    U->>UI: Submit preferences
-    UI->>UI: Validate input
-    UI->>D: load_catalog()
-    D-->>UI: List of Restaurant
-    UI->>F: filter(catalog, preferences)
-    F-->>UI: Shortlist (≤ N restaurants)
+    U->>FE: Submit preferences
+    FE->>API: POST /recommendations
+    API->>ORCH: orchestrator.run(PipelineRequest)
 
-    alt Shortlist empty
-        UI-->>U: Empty state + suggestions
-    else Shortlist non-empty
-        UI->>P: build_prompt(shortlist, preferences)
-        P-->>R: Prompt messages
-        R->>L: complete(prompt)
-        L-->>R: Raw JSON text
-        R->>R: Parse + validate Recommendations
+    ORCH->>CACHE: get(cache_key)
+    alt Cache hit
+        CACHE-->>ORCH: PipelineResponse
+        ORCH-->>API: PipelineResponse (latency_ms=0)
+    else Cache miss
+        ORCH->>FILTER: filter_restaurants(catalog, prefs)
+        FILTER-->>ORCH: FilterResult (shortlist)
 
-        alt LLM success
-            R-->>UI: List of Recommendation
-        else LLM failure
-            R-->>UI: Fallback rankings + template explanation
+        alt Shortlist empty
+            ORCH-->>API: PipelineResponse (filter_code=EMPTY_SHORTLIST, hints)
+        else Shortlist non-empty
+            ORCH->>LLM: complete(messages)
+            LLM-->>ORCH: JSON recommendations
+            ORCH->>CACHE: set(cache_key, response)
+            ORCH-->>API: PipelineResponse (rec_code=OK)
         end
-
-        UI-->>U: Display table / cards
     end
-```
 
-**Typical Latency Budget (MVP)**
-
-| Step | Target |
-|------|--------|
-| Load catalog (cached) | &lt; 500 ms |
-| Filter shortlist | &lt; 1 s |
-| Groq LLM call | 1–10 s (model-dependent) |
-| Render UI | &lt; 100 ms |
-
----
-
-## 5. Component Design
-
-### 5.1 Data Layer
-
-**Purpose:** Ingest and preprocess the Zomato dataset; expose a stable in-memory (or cached) catalog.
-
-| Component | File (suggested) | Description |
-|-----------|------------------|-------------|
-| `Restaurant` model | `src/models/restaurant.py` | Canonical record after normalization |
-| `ingest` | `src/data/ingest.py` | Download via `datasets`, clean, write cache |
-| `load_catalog` | `src/data/ingest.py` | Read cache or re-ingest; return `list[Restaurant]` |
-
-**Ingestion pipeline**
-
-```mermaid
-flowchart LR
-    A[HF Dataset] --> B[Schema inspect]
-    B --> C[Column map]
-    C --> D[Normalize types]
-    D --> E[Drop invalid rows]
-    E --> F[Write parquet/csv]
-    F --> G[load_catalog]
-```
-
-**Extracted fields (minimum)**
-
-| Field | Type | Notes |
-|-------|------|-------|
-| `id` | string | Stable identifier (generated if missing) |
-| `name` | string | Restaurant name |
-| `location` | string | City / area |
-| `cuisines` | list[str] or string | Tokenized for matching |
-| `rating` | float | Aggregate rating |
-| `cost_for_two` | float | Used for budget bands |
-| `metadata` | dict (optional) | Extra columns for future filters |
-
-**Caching:** Processed catalog stored under `data/` (gitignored). Second run skips HF download when cache is fresh.
-
----
-
-### 5.2 Filtering Layer
-
-**Purpose:** Apply deterministic rules from [User Input](./context.md#2-user-input) before any LLM call.
-
-| Component | File (suggested) | Description |
-|-----------|------------------|-------------|
-| `UserPreferences` | `src/models/preferences.py` | Input contract from UI/CLI |
-| `FilterEngine` | `src/filter/engine.py` | `filter(catalog, prefs) -> list[Restaurant]` |
-
-**Preference model**
-
-```python
-# Conceptual contract (not implementation)
-UserPreferences:
-    location: str           # e.g. "Delhi", "Bangalore"
-    budget: Literal["low", "medium", "high"]
-    cuisine: str            # e.g. "Italian", "Chinese"
-    min_rating: float       # e.g. 4.0
-    extras: list[str]       # e.g. ["family-friendly", "quick service"]
-```
-
-**Filter rules**
-
-| Preference | Rule |
-|------------|------|
-| Location | Case-insensitive match on `location` (substring or exact, configurable) |
-| Min rating | `restaurant.rating >= min_rating` |
-| Cuisine | Token or substring match on `cuisines` |
-| Budget | Map `low` / `medium` / `high` to `cost_for_two` ranges (defined after dataset EDA) |
-| Extras | Keyword boost/filter on name or metadata when available |
-
-**Shortlist cap:** Sort by rating descending; return top **20–50** rows to limit prompt size.
-
-**Empty shortlist:** Return structured error with hints (lower `min_rating`, broaden cuisine, change location).
-
----
-
-### 5.3 Integration Layer
-
-**Purpose:** Bridge structured data and the LLM per [Integration Layer](./context.md#3-integration--llm-prompting-layer).
-
-| Component | File (suggested) | Description |
-|-----------|------------------|-------------|
-| `PromptBuilder` | `src/llm/prompts.py` | System + user messages |
-| `LLMClient` | `src/llm/client.py` | Provider abstraction (`complete(messages) -> str`) |
-| `GroqClient` | `src/llm/client.py` | Default implementation using [Groq](https://console.groq.com/) chat completions |
-| `ResponseParser` | `src/recommendation/engine.py` | JSON parse + schema validation |
-
-**Prompt design principles**
-1. **Grounding** — Instruct the model to choose **only** restaurants present in the provided shortlist (by name/id).
-2. **Structured output** — Require JSON array matching `Recommendation` schema.
-3. **Reasoning** — Ask for a short explanation per pick tied to user preferences.
-4. **Ranking** — Explicit order: best match first; cap at top 5 (configurable).
-5. **Optional summary** — One-line overview of the set when useful for UI.
-
-**Prompt structure (conceptual)**
-
-```
-System:
-  You are a restaurant advisor. Use only restaurants from the list.
-  Output valid JSON: array of { restaurant_name, cuisine, rating, estimated_cost, explanation }.
-
-User:
-  Preferences: { location, budget, cuisine, min_rating, extras }
-  Shortlist: [ { name, location, cuisines, rating, cost_for_two }, ... ]
-  Return top 5 ranked recommendations.
-```
-
-**Token control:** Truncate long cuisine strings; omit non-essential columns from shortlist serialization.
-
-**Groq configuration (default provider)**
-
-| Variable | Purpose | Example |
-|----------|---------|---------|
-| `GROQ_API_KEY` | API key from [Groq Console](https://console.groq.com/keys) | `gsk_...` |
-| `GROQ_MODEL` | Chat model id | `llama-3.3-70b-versatile` |
-| `MOCK_LLM` | Skip Groq; use rule-based fallback | `1` |
-
-`GroqClient` uses the official `groq` Python SDK with `response_format` JSON when supported. The Streamlit app (Phase 4) calls the same `RecommendationEngine` path—no separate OpenAI dependency in the MVP.
-
----
-
-### 5.4 Recommendation Engine
-
-**Purpose:** Orchestrate LLM call and produce final [Output Display](./context.md#5-output-presentation) objects.
-
-| Component | File (suggested) | Description |
-|-----------|------------------|-------------|
-| `Recommendation` | `src/models/recommendation.py` | Output contract |
-| `RecommendationEngine` | `src/recommendation/engine.py` | `recommend(shortlist, prefs) -> list[Recommendation]` |
-
-**Output model**
-
-| Field | Source |
-|-------|--------|
-| `restaurant_name` | LLM (must match shortlist) |
-| `cuisine` | LLM or joined from catalog |
-| `rating` | LLM or catalog |
-| `estimated_cost` | LLM or catalog (`cost_for_two`) |
-| `explanation` | LLM-generated |
-| `summary` (optional) | LLM one-liner for entire result set |
-
-**Fallback path**
-
-```mermaid
-flowchart TD
-    A[LLM call] --> B{Success?}
-    B -->|Yes| C[Parse JSON]
-    C --> D{Valid schema?}
-    D -->|Yes| E[Return recommendations]
-    D -->|No| F[Retry once]
-    F --> G{Valid?}
-    G -->|Yes| E
-    G -->|No| H[Fallback]
-    B -->|No| H
-    H --> I[Top-N from filter by rating]
-    I --> J[Template explanation]
-    J --> E
+    API-->>FE: RecommendationResponse (JSON)
+    FE-->>U: Render result cards
 ```
 
 ---
 
-### 5.5 Presentation Layer
+## 5. Data contracts
 
-**Purpose:** Collect [User Input](./context.md#2-user-input) and render [Output Display](./context.md#5-output-presentation).
-
-| Component | File (suggested) | Description |
-|-----------|------------------|-------------|
-| Streamlit app | `src/app/streamlit_app.py` | MVP web UI |
-| CLI (optional) | `src/cli/main.py` | Scriptable demo |
-
-**UI responsibilities**
-- Form: location, budget (select), cuisine, min rating, extras.
-- Client-side validation (required fields, rating range).
-- Loading indicator during LLM call.
-- Result cards/table with all five output fields.
-- Empty and error states without stack traces.
-
----
-
-## 6. Data Contracts
-
-### 6.1 Restaurant (Internal)
-
+### 5.1 `Restaurant` (internal catalog record)
 ```json
 {
-  "id": "r_12345",
-  "name": "Example Bistro",
+  "id": "r_abc123",
+  "name": "Spice Hub",
   "location": "Bangalore",
-  "cuisines": ["Italian", "Continental"],
-  "rating": 4.2,
-  "cost_for_two": 800.0,
-  "metadata": {}
+  "cuisines": ["North Indian", "Mughlai"],
+  "rating": 4.6,
+  "cost_for_two": 550.0,
+  "metadata": { "area": "Koramangala", "rest_type": "Casual Dining" }
 }
 ```
 
-### 6.2 UserPreferences (Input)
-
+### 5.2 `UserPreferences` (pipeline input)
 ```json
 {
-  "location": "Delhi",
+  "location": "Bangalore",
   "budget": "medium",
   "cuisine": "North Indian",
   "min_rating": 4.0,
@@ -356,183 +148,241 @@ flowchart TD
 }
 ```
 
-### 6.3 Recommendation (Output)
-
+### 5.3 `Recommendation` (LLM output per item)
 ```json
 {
-  "restaurant_name": "Example Bistro",
-  "cuisine": "Italian",
-  "rating": 4.2,
-  "estimated_cost": 800,
-  "explanation": "Strong match for medium budget and 4+ rating in Delhi."
+  "restaurant_name": "Spice Hub",
+  "cuisine": "North Indian",
+  "rating": 4.6,
+  "estimated_cost": 550,
+  "explanation": "Ranked #1 for North Indian in Bangalore at medium budget — high rating and great value."
+}
+```
+
+### 5.4 `PipelineRequest` / `PipelineResponse` (orchestration contract)
+```json
+// Request
+{ "preferences": { ... }, "max_recommendations": 5, "request_id": "uuid" }
+
+// Response
+{
+  "request_id": "uuid",
+  "recommendations": [ ... ],
+  "summary": "Top North Indian picks in Bangalore.",
+  "filter_code": "OK",
+  "rec_code": "OK",
+  "used_fallback": false,
+  "hints": [],
+  "latency_ms": 2800,
+  "shortlist_size": 50
+}
+```
+
+### 5.5 `RecommendationRequest` / `RecommendationResponse` (HTTP API contract)
+```json
+// POST /recommendations — request body
+{
+  "location": "Bangalore",
+  "budget": "medium",
+  "cuisine": "North Indian",
+  "min_rating": 4.0,
+  "extras": [],
+  "max_recommendations": 5
+}
+
+// 200 response
+{
+  "request_id": "uuid",
+  "recommendations": [
+    {
+      "restaurant_name": "Spice Hub",
+      "cuisine": "North Indian",
+      "rating": 4.6,
+      "estimated_cost": 550,
+      "explanation": "..."
+    }
+  ],
+  "summary": "Top picks for you.",
+  "filter_code": "OK",
+  "rec_code": "OK",
+  "used_fallback": false,
+  "hints": [],
+  "latency_ms": 2800,
+  "shortlist_size": 50
 }
 ```
 
 ---
 
-## 7. Deployment Views
+## 6. API Layer (Phase 7)
 
-### 7.1 MVP (Single Process)
+### Endpoints
 
-```mermaid
-flowchart TB
-    subgraph Machine["Developer / Demo Machine"]
-        ST[Streamlit Process]
-        CACHE[(data/restaurants.parquet)]
-        ENV[.env GROQ_API_KEY]
-    end
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | System status: catalog loaded, Groq key present, mock mode |
+| `GET` | `/cities` | Top 50 cities by restaurant count |
+| `GET` | `/cuisines` | Top 50 cuisines by frequency |
+| `POST` | `/recommendations` | Main recommendation endpoint |
+| `GET` | `/docs` | Interactive Swagger UI (auto-generated) |
 
-    ST --> CACHE
-    ST --> ENV
-    ST --> API[Groq API]
-```
+### Error handling
 
-* One Python process.
-* Secrets in `.env` (never committed).
-* No separate database in MVP.
+| Scenario | HTTP status | Body |
+|----------|-------------|------|
+| Invalid request (missing field, bad type) | 422 | FastAPI validation error detail |
+| Empty shortlist (impossible prefs) | 200 | `filter_code=EMPTY_SHORTLIST`, `hints` populated |
+| LLM failure | 200 | `used_fallback=true`, fallback recommendations present |
+| Catalog not loaded | 503 | `{ "detail": "Catalog unavailable" }` |
 
-### 7.2 Target (Optional Extension)
-
-```mermaid
-flowchart LR
-    Client[Web / Mobile] --> API[FastAPI]
-    API --> Filter
-    API --> Rec[Recommendation Engine]
-    API --> Cache[(Redis / file cache)]
-    Rec --> Groq[Groq API]
-```
-
-See [Extension points](#11-extension-points).
+### CORS
+Configured via `ALLOWED_ORIGINS` env var (default: `*` for dev). Restrict to the frontend URL in production.
 
 ---
 
-## 8. Cross-Cutting Concerns
+## 7. Frontend Layer (Phase 8)
 
-### 8.1 Security
+### Technology
+- **Framework:** Next.js 14 (App Router)
+- **Styling:** Tailwind CSS + shadcn/ui
+- **Animation:** Framer Motion
+- **API client:** `fetch` with typed wrappers in `frontend/lib/api.ts`
 
-| Concern | Mitigation |
-|---------|------------|
-| API keys | `GROQ_API_KEY` in environment only; `.env` gitignored |
-| Prompt injection | Treat user `extras` as untrusted; sanitize length; system prompt restricts scope |
-| Data leakage | Do not log full prompts with PII in production |
+### Pages
 
-### 8.2 Reliability
+| Route | Component | Description |
+|-------|-----------|-------------|
+| `/` | `app/page.tsx` | Hero + preference form (location, budget, cuisine, rating, extras) |
+| `/results` | `app/results/page.tsx` | Result cards, summary bar, filter chips |
 
-| Concern | Mitigation |
-|---------|------------|
-| LLM timeout / rate limit | Configurable timeout; retry once; fallback to filter ranking |
-| Malformed JSON | Schema validation; retry; fallback |
-| Empty catalog | Fail fast at startup with clear error |
+### Key components
 
-### 8.3 Observability (MVP)
-* Log: catalog size, shortlist size, LLM latency, fallback usage.
-* Do not log: API keys, full API responses in debug without redaction.
+| Component | Purpose |
+|-----------|---------|
+| `PreferenceForm` | Controlled form; calls `POST /recommendations` on submit |
+| `RestaurantCard` | Rank badge, name, cuisine pill, ★ rating, ₹ cost, AI explanation |
+| `LoadingState` | 3-step animated progress (filter → Groq → render) |
+| `EmptyState` | Illustration + suggestion chips from `hints` array |
+| `FallbackBanner` | Amber warning when `used_fallback=true` |
+| `HealthIndicator` | Sidebar: catalog ✅/❌ · Groq ✅/⚠️/❌ |
 
-### 8.4 Testing Strategy
-
-| Layer | Test Type |
-|-------|-------------|
-| Filter | Unit tests with fixture restaurants |
-| Integration / LLM | Mock client returning fixed JSON |
-| End-to-end | Optional live test behind `RUN_LLM_INTEGRATION=1` |
-| UI | Manual smoke checklist (see implementation plan) |
+### Design tokens
+| Token | Value | Usage |
+|-------|-------|-------|
+| Background | `#1A1A2E` | Page background |
+| Primary accent | `#FF4C29` | CTA button, active states |
+| AI gradient | `#7C3AED → #2563EB` | AI explanation blocks, loading state |
+| Card background | `#FFFFFF` | Restaurant cards |
 
 ---
 
-## 9. Physical Module Layout
+## 8. Deployment (Phase 9)
 
-Aligned with [implementation-plan.md — Suggested repo structure](./docs/implementation-plan.md#suggested-repo-structure):
+### Single-machine Docker Compose (dev / demo)
+
+```
+Browser
+  │
+  ├── :3000 → frontend service (Next.js)
+  │                │
+  └── :8000 → api service (FastAPI/uvicorn)
+                   │
+              data/ volume (parquet cache)
+```
+
+### Cloud (production)
+
+```
+Vercel (frontend)              Railway / Render (backend)
+     │                                  │
+     └── NEXT_PUBLIC_API_URL ──────────►│
+                                   Groq API
+```
+
+### CI (GitHub Actions)
+- **Python job:** `pytest` (mocked, no Groq key)
+- **Node job:** `npm ci && npm test` in `frontend/`
+
+---
+
+## 9. Physical module layout (current → target)
 
 ```
 src/
-├── models/
-│   ├── restaurant.py       # Data layer contract
-│   ├── preferences.py      # User input contract
-│   └── recommendation.py   # Output contract
-├── data/
-│   └── ingest.py           # HF load, normalize, cache
-├── filter/
-│   └── engine.py           # Deterministic shortlist
-├── llm/
-│   ├── client.py           # GroqClient + LLMClient interface
-│   └── prompts.py          # Prompt templates
-├── recommendation/
-│   └── engine.py           # LLM orchestration + fallback
-└── app/
-    └── streamlit_app.py    # Presentation
+├── models/          # Phase 1–3: data contracts
+├── data/            # Phase 1: ingest + cache
+├── filter/          # Phase 2: deterministic filter
+├── llm/             # Phase 3: Groq client + prompts
+├── recommendation/  # Phase 3–6: engine, orchestrator, cache, contracts
+├── app/             # Phase 4–5: Streamlit MVP (remains as fallback UI)
+└── api/             # Phase 7: FastAPI REST API  ← NEW
+
+frontend/            # Phase 8: React/Next.js frontend  ← NEW
 ```
 
-**Dependency rule:** Higher layers depend on lower layers only (app → recommendation → filter → data). `llm` is used by `recommendation`, not by `filter`.
-
-```mermaid
-flowchart BT
-    app --> recommendation
-    recommendation --> llm
-    recommendation --> filter
-    filter --> models
-    filter --> data
-    data --> models
-```
+**Dependency rule:** API layer imports from `recommendation/` only. Frontend imports from no Python code — consumes HTTP only.
 
 ---
 
-## 10. Mapping: context.md → Architecture
+## 10. Cross-cutting concerns
 
-| context.md Section | Architecture Artifact |
-|--------------------|------------------------|
-| 1. Data Ingestion | Data layer, `ingest.py`, local cache |
-| 2. User Input | `UserPreferences`, UI form, filter rules |
-| 3. Integration Layer | `PromptBuilder`, `LLMClient`, shortlist serialization |
-| 4. Recommendation Engine | `RecommendationEngine`, fallback, optional summary |
-| 5. Output Presentation | `Recommendation` model, Streamlit table/cards |
+### Security
+| Concern | Mitigation |
+|---------|------------|
+| API keys | `GROQ_API_KEY` in env only; never logged; never in image |
+| CORS | Restrict `ALLOWED_ORIGINS` to frontend URL in production |
+| Prompt injection | User extras length-capped; system prompt restricts scope to shortlist |
+| Input validation | Pydantic enforces types/ranges on all API inputs |
 
----
+### Reliability
+| Concern | Mitigation |
+|---------|------------|
+| LLM timeout | 30 s timeout on Groq client; retry once; fallback |
+| Malformed JSON | Retry + fallback in `recommendation/engine.py` |
+| Empty catalog | 503 from API health check; startup log warning |
+| Stale cache | `CACHE_TTL_SECONDS` (default 300 s); `DISABLE_CACHE=1` bypass |
 
-## 11. Extension Points
-
-Designed for incremental evolution without rewriting core layers ([implementation-plan Phase 6](./docs/implementation-plan.md#phase-6--extensions-optional)).
-
-| Extension | Touch Layers | Notes |
-|-----------|--------------|-------|
-| **REST API** | Presentation → new `api/` package | FastAPI wraps existing pipeline; same contracts |
-| **Recommendation cache** | Integration + Recommendation | Key = hash(preferences + shortlist ids); TTL configurable |
-| **Feedback loop** | Presentation + new `feedback/` store | Thumbs up/down; prompt tuning notes only in MVP |
-| **Multi-city / i18n** | Data + Presentation | Autocomplete locations from catalog |
-| **Observability** | All | Structured logs, metrics export |
-| **Alternative LLM** | `llm/client.py` only | Groq is default; add another `LLMClient` (e.g. OpenAI) if needed |
-| **Vector search** | Filter + Data | Optional semantic cuisine/ambiance matching before LLM |
+### Observability
+- Structured pipeline log per step: `{"step": "filter", "shortlist": 12, "latency_ms": 4}`
+- `GET /health` returns live system status
+- LLM latency logged on every Groq call
 
 ---
 
-## 12. Technology Choices (MVP Defaults)
+## 11. Technology choices
 
 | Concern | Choice | Alternatives |
 |---------|--------|--------------|
 | Language | Python 3.11+ | — |
-| Dataset access | `datasets` + `pandas` | Direct CSV download |
-| UI | Streamlit | CLI, Gradio |
-| LLM | **Groq** via `groq` SDK | OpenAI, Anthropic (swap `LLMClient` only) |
-| Cache format | Parquet or CSV | SQLite for larger scale |
-| Tests | `pytest` | unittest |
+| Pipeline API | FastAPI + uvicorn | Flask, Django |
+| Frontend | Next.js 14 + Tailwind | Remix, SvelteKit |
+| LLM | Groq (`llama-3.3-70b-versatile`) | OpenAI, Anthropic |
+| Cache | In-memory LRU (Phase 6), Redis (Phase 10) | Memcached |
+| Dataset access | `datasets` + `pandas` + parquet | Direct CSV |
+| MVP UI | Streamlit | Gradio |
+| Tests | `pytest` (backend), Jest / RTL (frontend) | unittest |
+| Container | Docker + Compose | Podman |
+| CI | GitHub Actions | GitLab CI |
 
 ---
 
-## 13. Known Limitations
+## 12. Known limitations
 
-* **Dataset coverage** — Recommendations limited to cities and restaurants present in the Hugging Face dataset.
-* **Budget mapping** — `low` / `medium` / `high` thresholds are heuristic until calibrated on data distribution.
-* **LLM grounding** — Prompt constraints reduce but do not eliminate wrong picks; validation should cross-check names against shortlist.
-* **Cost** — Each Groq request may incur API usage; Groq free tier limits apply; caching and shortlist caps mitigate volume.
-* **No auth in MVP** — Single-user local demo; add auth at API layer for multi-tenant deployments.
+- **Dataset coverage** — Primarily Bangalore; other cities have sparse data
+- **Budget bands** — `low ≤ ₹400`, `medium ₹401–800`, `high > ₹800` are heuristic
+- **LLM grounding** — Prompt constraints reduce but don't eliminate hallucinations; cross-check validates restaurant names against shortlist
+- **In-memory cache** — Resets on server restart; replace with Redis for persistence (Phase 10)
+- **Single-user MVP** — No auth; add at API layer for multi-tenant (Phase 10)
 
 ---
 
-## 14. Document Map
+## 13. Document map
 
 ```
-problemStatement.md          →  why (goals)
-context.md                   →  what (workflow)
-architecture.md              →  how (structure) — this file
-docs/implementation-plan.md  →  when (phases)
-docs/edge-cases.md           →  failure modes & handling
+problemStatement.md  →  why (goals)
+context.md           →  what (workflow + output fields)
+architecture.md      →  how (structure) — this file
+implementation-plan.md → when (phases)
+edge-cases.md        →  what can go wrong
+deployment.md        →  how to ship it
 ```
