@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { Budget, RecommendationRequest } from '@/lib/types';
 
 interface Props {
@@ -7,13 +7,19 @@ interface Props {
   cuisines: string[];
   onSubmit: (req: RecommendationRequest) => void;
   loading: boolean;
+  apiOffline?: boolean;
 }
 
 const EXTRAS = ['family-friendly', 'quick service', 'outdoor seating', 'rooftop', 'quiet'];
 
-export default function PreferenceForm({ cities, cuisines, onSubmit, loading }: Props) {
-  const [location, setLocation]   = useState(cities[0] ?? 'Bangalore');
+export default function PreferenceForm({ cities, cuisines, onSubmit, loading, apiOffline }: Props) {
+  const [location, setLocation]   = useState('');
   const [custom,   setCustom]     = useState('');
+
+  // Sync first city once API loads
+  useEffect(() => {
+    if (cities.length > 0 && !location) setLocation(cities[0]);
+  }, [cities]);
   const [budget,   setBudget]     = useState<Budget>('medium');
   const [cuisine,  setCuisine]    = useState('North Indian');
   const [rating,   setRating]     = useState(4.0);
@@ -138,9 +144,9 @@ export default function PreferenceForm({ cities, cuisines, onSubmit, loading }: 
 
       {error && <p className="text-sm text-red-600 font-medium">{error}</p>}
 
-      <button type="submit" disabled={loading}
+      <button type="submit" disabled={loading || apiOffline || cities.length === 0}
         className="w-full py-3 rounded-full bg-primary text-white font-bold text-sm shadow-lg shadow-primary/25 hover:bg-primary-dark transition-all disabled:opacity-60 disabled:cursor-not-allowed">
-        {loading ? 'Finding…' : 'Find Restaurants →'}
+        {apiOffline ? 'API offline — start with: make api' : loading ? 'Finding…' : cities.length === 0 ? 'Loading locations…' : 'Find Restaurants →'}
       </button>
     </form>
   );

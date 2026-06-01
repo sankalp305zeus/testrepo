@@ -1,19 +1,10 @@
-# Ensure project root is on sys.path when run via `streamlit run src/app/streamlit_app.py`
+# from __future__ must be the very first statement — sys.path fix comes right after
+from __future__ import annotations
+
 import sys as _sys, pathlib as _pl
 _root = str(_pl.Path(__file__).resolve().parents[2])
 if _root not in _sys.path:
     _sys.path.insert(0, _root)
-
-"""Streamlit UI — Zomato AI Recommends.
-
-Design system based on Google Stitch output (stitch_zomato_ai_recommends.zip).
-
-Run:
-    streamlit run src/app/streamlit_app.py
-    MOCK_LLM=1 streamlit run src/app/streamlit_app.py
-"""
-
-from __future__ import annotations
 
 import logging
 import os

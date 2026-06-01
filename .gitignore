@@ -25,3 +25,5 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+frontend/.next/
+frontend/node_modules/
