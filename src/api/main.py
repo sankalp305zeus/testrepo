@@ -44,12 +44,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up — loading restaurant catalog...")
+    preloaded_catalog = getattr(app.state, "catalog", None)
     try:
         app.state.catalog = load_catalog()
         logger.info("Catalog loaded: %d restaurants", len(app.state.catalog))
     except Exception as exc:
         logger.error("Catalog load failed: %s", exc)
-        app.state.catalog = []
+        if preloaded_catalog is not None:
+            app.state.catalog = preloaded_catalog
+            logger.info("Using preloaded catalog: %d restaurants", len(app.state.catalog))
+        else:
+            app.state.catalog = []
 
     app.state.pipeline_cache = build_cache()
     logger.info("Pipeline cache: %s", app.state.pipeline_cache)
